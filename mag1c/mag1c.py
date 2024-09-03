@@ -129,15 +129,18 @@ def acrwl1mf(
         )  # [b x 1 x s] * [b x s x 1] = [b x 1 x 1]
     target = torch.mul(template, mu)  # [1 x 1 x s] * [b x 1 x s] = [b x 1 x s]
     xmean = modx - mu
-    C = torch.div(
-        torch.bmm(torch.transpose(xmean, 1, 2), xmean), N
+    C = (
+        torch.bmm(torch.transpose(xmean, 1, 2), xmean) / N
     )  # [b x s x p] * [b x p x s] = [b x s x s]
     C = C.lerp_(
         torch.diag_embed(torch.diagonal(C, dim1=-2, dim2=-1)), alpha
     )  # C = (1-alpha) * S + alpha * diag(S)
     # Cit, _ = torch.gesv(torch.transpose(target, 1, 2), C)  # [b x s x 1] \ [b x s x s] = [b x s x 1]
+    # print(np.linalg.eigvals(C.cpu().numpy()))  # check if eigenvalues are positive
     Cit = torch.cholesky_solve(
-        torch.transpose(target, 1, 2), torch.cholesky(C, upper=False), upper=False
+        torch.transpose(target, 1, 2),
+        torch.linalg.cholesky(C, upper=False),
+        upper=False,
     )
     normalizer = torch.bmm(target, Cit)  # [b x 1 x s] * [b x s x 1] = [b x 1 x 1]
     mf = torch.div(
@@ -166,7 +169,9 @@ def acrwl1mf(
         )
         C = C.lerp_(torch.diag_embed(torch.diagonal(C, dim1=-2, dim2=-1)), alpha)
         Cit = torch.cholesky_solve(
-            torch.transpose(target, 1, 2), torch.cholesky(C, upper=False), upper=False
+            torch.transpose(target, 1, 2),
+            torch.linalg.cholesky(C, upper=False),
+            upper=False,
         )
         # Compute matched filter with regularization
         normalizer = torch.bmm(target, Cit, out=normalizer)
@@ -297,6 +302,9 @@ def generate_template_from_bands(
         np.stack((np.ones_like(concentrations), concentrations)).T, lograd, rcond=None
     )
     spectrum = slope[1, :] * SCALING
+    # print(f"spectrum_{spectrum}")
+    # print(f"centers_{centers}")
+    # np.save("/Users/jonasherec/tacr-trend9-ops/methan_absorbance_per_emit_channel.npy", spectrum)
     target = np.stack(
         (centers, spectrum)
     ).T  # np.stack((np.arange(spectrum.shape[0]), centers, spectrum)).T
@@ -481,6 +489,8 @@ class GroupedRadianceMemmappedFileDataset(torch.utils.data.Dataset):
         # Return data and where it is from in the image to main thread
         if sat_mask is not None:
             return data, censor_mask, col_idx, load_time, sat_mask
+        # data = data.byteswap().newbyteorder()  # only for EO-1 data with big endian
+        # data = data.astype(np.int16)
         return data, censor_mask, col_idx, load_time
 
 
@@ -909,18 +919,13 @@ def main():
 
     # Open the specified radiance file as a memory-mapped object
     qprint("Opening radiance data file.")
-    rdn_file = spectral.io.envi.open(args.rdn + ".hdr")
+    rdn_file = spectral.io.envi.open(args.rdn + ".hdr", args.rdn + ".img")
     rdn_file_memmap = rdn_file.open_memmap(interleave="bip", writable=False)
 
     if args.spec is None:  # Convolve internal methane spectrum for header bands/fwhm.
-        if str(rdn_file.bands.band_unit).lower() in ["nanometers", "nanometer", "nm"]:
-            target = generate_template_from_bands(
-                centers=rdn_file.bands.centers, fwhm=rdn_file.bands.bandwidths
-            )
-        else:
-            raise RuntimeError(
-                f"Unknown band wavelength unit: {rdn_file.bands.band_unit}"
-            )
+        target = generate_template_from_bands(
+            centers=rdn_file.bands.centers, fwhm=rdn_file.bands.bandwidths
+        )
         qprint("Target spectrum generated successfully.")
     else:  # Load the target spectrum file that was provided by the user
         qprint(f"Loading target spectrum from {args.spec}")
@@ -1179,7 +1184,7 @@ def main():
         output_filename = f"{args.out}.hdr"
     else:
         output_filename = (
-            os.path.basename(args.rdn)[: len("xxxYYYYMMDDtHHMMSS")] + "_ch4_cmfr"
+            os.path.basename(args.rdn)[: len("xxxYYYYMMDDtHHMMSS")] + "_ch4_cmfr.hdr"
         )
     output_file = spectral.io.envi.create_image(
         output_filename, output_metadata, force=args.overwrite, ext=""
@@ -1204,7 +1209,7 @@ def main():
     for step, batch in enumerate(dataset, 1):
         end = "\n" if step % 15 == 0 else ""
         qprint(
-            f"{step:{np.ceil(np.log10(len(dataset))).astype(np.int)}}, ",
+            f"{step:{np.ceil(np.log10(len(dataset))).astype(int)}}, ",
             end=end,
             flush=True,
         )
