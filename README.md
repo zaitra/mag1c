@@ -1,4 +1,16 @@
-# MAG1C:  Matched filter with Albedo correction and reweiGhted L1 sparsity Code
+# MAG1C-SAS: Matched filter with Albedo correction and reweiGhted L1 Sparsity, Sped up with Additional Sparsity
+
+This repository is a fork of **MAG1C**, modified slightly to create **MAG1C-SAS**. Two additional flags are now available:
+
+- `--save-target-spectrum-centers`  
+  Saves the centers and target spectrum values as two separate NumPy arrays.
+
+- `--sample [value from 0 to 1]`  
+  Instead of running the classic MAG1C, MAG1C-SAS is executed with a specified sample size (given as a fraction between 0 and 1).
+
+Additional timing measurements are included (similar to those used for our other filters). This only records the time taken by the core filter function, excluding preprocessing.
+
+Everything else remains unchanged, so below is original README:
 
 [![Article DOI:10.1109/TGRS.2020.2976888](https://img.shields.io/badge/Article%20DOI-10.1109%2FTGRS.2020.2976888-blue)](https://doi.org/10.1109/TGRS.2020.2976888) [![ArXiv:2003.02978](https://img.shields.io/badge/arXiv-2003.02978-blue)](https://arxiv.org/abs/2003.02978) ![GitHub release (latest SemVer including pre-releases)](https://img.shields.io/github/v/release/markusfoote/mag1c?include_prereleases&sort=semver) ![PyPI](https://img.shields.io/pypi/v/mag1c) ![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mag1c) ![PyPI - License](https://img.shields.io/pypi/l/mag1c)
 

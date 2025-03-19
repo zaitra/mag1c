@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-#
+# This code contains Mag1c along with additional logic which enables using only sample of data for the covariance and mean computation.
+# The original license is as follows:
 #       M ethane detection with
 #       A lbedo correction and
 # rewei G hted
@@ -51,6 +52,7 @@ import torch.utils.data
 from skimage import morphology, measure
 from typing import Tuple, Optional, Union, List
 
+METHANE_BENCHMARKS_TOTAL_TIME = 0
 RGB = [640, 550, 460]
 NODATA = -9999
 SAT_THRESH_DEFAULT = 6.0
@@ -73,6 +75,7 @@ def acrwl1mf(
     covariance_update_scaling: float,
     alpha: float,
     mask: Optional[torch.Tensor],
+    sample: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Calculate the albedo-corrected reweighted-L1 matched filter on radiance data.
 
@@ -177,6 +180,79 @@ def acrwl1mf(
         normalizer = torch.bmm(target, Cit, out=normalizer)
         if torch.sum(torch.lt(normalizer, 1)):
             normalizer = normalizer.clamp_(min=1)
+        if num_iter == i+1 and sample:
+            return mu, Cit, normalizer
+        mf = torch.div(torch.bmm(x - mu, Cit) - regularizer, torch.mul(R, normalizer))
+        mf = torch.nn.functional.relu_(mf)
+        # TODO energy
+    mf = torch.mul(mf, scaling, out=mf)
+    return mf, R
+
+@torch.no_grad()
+def acrwl1mf_compact(
+    x: torch.Tensor,
+    normalizer: torch.Tensor,
+    num_iter: int,
+    albedo_override: bool,
+    zero_override: bool,
+    sparse_override: bool,
+    mu: torch.Tensor,
+    Cit: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Calculate the albedo-corrected reweighted-L1 matched filter on radiance data.
+
+    :param x: Radiance Data to process. See notes below on format.
+    :param normalizer: Normalizer computed from sample.
+    :param num_iter: Number of iterations to run.
+    :param albedo_override: Do not calculate or apply albedo correction factor.
+    :param zero_override: Do not apply non-negativity constraint on matched filter results.
+    :param sparse_override: Do not use sparse regularization in iterations when True.
+    :param mu: Band means computed from sample.
+    :param Cit: Inverted Covariance matrix computed from sample
+    :returns mf, albedo
+
+        x must be 3-dimensional:
+        batch (columns or groups of columns) x
+        pixels (samples) x
+        spectrum (bands)
+
+        Notice that the samples dimension must be shared
+        by the batch, so only batches/columns with the same number
+        of pixels to process may be combined into a batch.
+    """
+    # Some constants / arrays to preallocate
+    dtype = x.dtype
+    device = x.device
+    N = x.shape[1]  # number of samples
+    regularizer = torch.zeros(x.shape[0], x.shape[1], 1, dtype=dtype, device=device)
+    scaling = torch.tensor(1e5, dtype=dtype, device=device)
+    epsilon = torch.tensor(1e-9, dtype=dtype, device=device)
+    # energy = torch.zeros(num_iter + 1, dtype=dtype, device=device)
+    # Initialize with normal robust matched filter
+    if albedo_override:
+        R = torch.ones((x.shape[0], N, 1), dtype=dtype, device=device)
+    else:
+        R = torch.div(
+            torch.bmm(
+                x, torch.transpose(mu, 1, 2)
+            ),  # [b x p x s] * [b x s x 1] = [b x p x 1]
+            torch.bmm(mu, torch.transpose(mu, 1, 2)),
+        )  # [b x 1 x s] * [b x s x 1] = [b x 1 x 1]
+    # Cit, _ = torch.gesv(torch.transpose(target, 1, 2), C)  # [b x s x 1] \ [b x s x s] = [b x s x 1]
+    # print(np.linalg.eigvals(C.cpu().numpy()))  # check if eigenvalues are positive
+    mf = torch.div(
+        torch.bmm(x - mu, Cit), torch.mul(R, normalizer)
+    )  # [b x p x s] * [b x s x 1] = [b x p x 1]
+    if not zero_override:
+        mf = torch.nn.functional.relu_(mf)  # max(mf, 0)
+    # TODO Calculate Energy
+    # Reweighted L1 Algorithm
+    for i in range(num_iter):
+        # Calculate new regularizer weights
+        if not sparse_override:  # regularizer pre-defined as zeros.
+            regularizer = torch.reciprocal(torch.mul(R, mf + epsilon), out=regularizer)
+        if torch.sum(torch.lt(normalizer, 1)):
+            normalizer = normalizer.clamp_(min=1)
         mf = torch.div(torch.bmm(x - mu, Cit) - regularizer, torch.mul(R, normalizer))
         mf = torch.nn.functional.relu_(mf)
         # TODO energy
@@ -256,7 +332,7 @@ def calculate_hfdi(
 
 
 def generate_template_from_bands(
-    centers: Union[np.ndarray, List], fwhm: Union[np.ndarray, List]
+    centers: Union[np.ndarray, List], fwhm: Union[np.ndarray, List], save: bool,
 ) -> np.ndarray:
     """Calculate a unit absorption spectrum for methane by convolving with given band information.
 
@@ -302,9 +378,9 @@ def generate_template_from_bands(
         np.stack((np.ones_like(concentrations), concentrations)).T, lograd, rcond=None
     )
     spectrum = slope[1, :] * SCALING
-    # print(f"spectrum_{spectrum}")
-    # print(f"centers_{centers}")
-    # np.save("/Users/jonasherec/tacr-trend9-ops/methan_absorbance_per_emit_channel.npy", spectrum)
+    if save:
+        np.save("mag1c_centers.npy", centers)
+        np.save("mag1c_spectrum.npy", spectrum)
     target = np.stack(
         (centers, spectrum)
     ).T  # np.stack((np.arange(spectrum.shape[0]), centers, spectrum)).T
@@ -594,8 +670,51 @@ class QuietPrinter(object):
 
 qprint = QuietPrinter(False)
 
+def compute_sampled_filter(args, rdn_data, sat_mask, spec):
+    global METHANE_BENCHMARKS_TOTAL_TIME
+    # Compute 5% sample size
+    sample_size = int(args.sample * rdn_data.shape[1])
+
+    # Compute step size to evenly distribute the samples
+    step_size = rdn_data.shape[1] // sample_size
+
+    # Select indices at regular intervals
+    indices = torch.arange(0, rdn_data.shape[1], step_size)[:sample_size]  # Ensure exact sample size
+    start_time = time.time() #Measure from here as the previous steps could be precomputed.
+    # Select the sampled subset
+    rdn_data_sample = rdn_data[:, indices, :]
+    sat_mask_sample = sat_mask[:,indices] if sat_mask is not None else None
+    mu, Cit, normalizer = acrwl1mf(
+        rdn_data_sample,
+        spec,
+        args.iter,
+        args.noalbedo,
+        args.nonnegativeoff,
+        args.no_sparsity,
+        args.covariance_update_scaling,
+        args.covariance_lerp_alpha,
+        torch.logical_not(sat_mask_sample) if sat_mask_sample is not None else None,
+        True,
+    )
+    mf_out, albedo_out = acrwl1mf_compact(
+        rdn_data,
+        normalizer,
+        3,
+        args.noalbedo,
+        args.nonnegativeoff,
+        args.no_sparsity,
+        mu,
+        Cit,
+    )
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    METHANE_BENCHMARKS_TOTAL_TIME += elapsed_time
+    print(f"Computation Done! Processing time: {elapsed_time:.4f} seconds")
+    return mf_out, albedo_out
+
 
 def main():
+    global METHANE_BENCHMARKS_TOTAL_TIME
     parser = argparse.ArgumentParser(
         description="       M atched filter with\n"
         "       A lbedo correction and\n"
@@ -874,6 +993,18 @@ def main():
         metavar="RADIANCE_FILE",
         help="ENVI format radiance file to process -- Provide the data file itself, not the header",
     )
+    parser.add_argument(
+        "--sample",
+        type=float,
+        default=1,
+        metavar="FLOAT",
+        help="If you specify float between 0 and 1, the covariance matrix and mean will be computed on small sample from data. So if you specify 0.01 it will be computed from 1 %.",
+    )
+    parser.add_argument(
+        "--save-target-spectrum-centers",
+        action="store_true",
+        help="Save band centers and target spectrum as .npy files (mag1c_centers.npy, mag1c_spectrum.npy)",
+    )
     # Add the help option back, because we had to remove it from initial parsing so that all options are present.
     parser.add_argument(
         "-h", "--help", action="help", help="show this help message and exit"
@@ -924,7 +1055,7 @@ def main():
 
     if args.spec is None:  # Convolve internal methane spectrum for header bands/fwhm.
         target = generate_template_from_bands(
-            centers=rdn_file.bands.centers, fwhm=rdn_file.bands.bandwidths
+            centers=rdn_file.bands.centers, fwhm=rdn_file.bands.bandwidths, save=args.save_target_spectrum_centers,
         )
         qprint("Target spectrum generated successfully.")
     else:  # Load the target spectrum file that was provided by the user
@@ -1267,30 +1398,50 @@ def main():
             )
 
             # Do main filter processing on masked pixels
-            mf_out[positive_mask, :], albedo_out[positive_mask, :] = acrwl1mf(
-                rdn_data[positive_mask, :].unsqueeze_(0),
-                spec,
-                args.iter,
-                args.noalbedo,
-                args.nonnegativeoff,
-                args.no_sparsity,
-                args.covariance_update_scaling,
-                args.covariance_lerp_alpha,
-                torch.logical_not(sat_mask) if sat_mask is not None else None,
-            )
+            if args.sample == 1:
+                start_time = time.time()
+                mf_out[positive_mask, :], albedo_out[positive_mask, :] = acrwl1mf(
+                    rdn_data[positive_mask, :].unsqueeze_(0),
+                    spec,
+                    args.iter,
+                    args.noalbedo,
+                    args.nonnegativeoff,
+                    args.no_sparsity,
+                    args.covariance_update_scaling,
+                    args.covariance_lerp_alpha,
+                    torch.logical_not(sat_mask) if sat_mask is not None else None,
+                    False,
+                )
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                METHANE_BENCHMARKS_TOTAL_TIME += elapsed_time
+                qprint(f"Computation Done! Processing time: {elapsed_time:.4f} seconds")
+            else:
+                mf_out[positive_mask, :], albedo_out[positive_mask, :] = compute_sampled_filter(args, rdn_data[positive_mask, :].unsqueeze_(0), sat_mask, spec)
+
         else:
-            # Do main filter processing
-            mf_out, albedo_out = acrwl1mf(
-                rdn_data,
-                spec,
-                args.iter,
-                args.noalbedo,
-                args.nonnegativeoff,
-                args.no_sparsity,
-                args.covariance_update_scaling,
-                args.covariance_lerp_alpha,
-                torch.logical_not(sat_mask) if sat_mask is not None else None,
-            )
+            if args.sample == 1:
+                # Do main filter processing
+                start_time = time.time()
+                mf_out, albedo_out = acrwl1mf(
+                    rdn_data,
+                    spec,
+                    args.iter,
+                    args.noalbedo,
+                    args.nonnegativeoff,
+                    args.no_sparsity,
+                    args.covariance_update_scaling,
+                    args.covariance_lerp_alpha,
+                    torch.logical_not(sat_mask) if sat_mask is not None else None,
+                    False,
+                )
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                METHANE_BENCHMARKS_TOTAL_TIME += elapsed_time
+                qprint(f"Computation Done! Processing time: {elapsed_time:.4f} seconds")
+            else:
+                mf_out, albedo_out = compute_sampled_filter(args, rdn_data, sat_mask, spec)
+                
 
         # Copy results back to cpu, no-op if already on cpu
         mf_out = mf_out.to(device=torch.device("cpu"))
@@ -1410,7 +1561,8 @@ def main():
 
     output_memmap.flush()
     run_time = time.time() - start
-    qprint(f"\nFilter processing completed in {run_time} seconds.")
+    print(f"\nFilter processing completed in {run_time} seconds.")
+    print(f"\nFilter processing completed in {METHANE_BENCHMARKS_TOTAL_TIME} seconds (measured similarly as for other filters).")
 
     # Do geocorrection based on the provided GLT file, if provided.
     if args.outputgeo is not None:
