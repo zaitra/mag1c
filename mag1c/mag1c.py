@@ -240,20 +240,21 @@ def acrwl1mf_compact(
         )  # [b x 1 x s] * [b x s x 1] = [b x 1 x 1]
     # Cit, _ = torch.gesv(torch.transpose(target, 1, 2), C)  # [b x s x 1] \ [b x s x s] = [b x s x 1]
     # print(np.linalg.eigvals(C.cpu().numpy()))  # check if eigenvalues are positive
-    mf = torch.div(
+    if torch.sum(torch.lt(normalizer, 1)):
+            normalizer = normalizer.clamp_(min=1)
+    mf_0 = torch.div(
         torch.bmm(x - mu, Cit), torch.mul(R, normalizer)
     )  # [b x p x s] * [b x s x 1] = [b x p x 1]
     if not zero_override:
-        mf = torch.nn.functional.relu_(mf)  # max(mf, 0)
+        mf_0 = torch.nn.functional.relu_(mf_0)  # max(mf, 0)
     # TODO Calculate Energy
+    mf = mf_0
     # Reweighted L1 Algorithm
     for i in range(num_iter):
         # Calculate new regularizer weights
         if not sparse_override:  # regularizer pre-defined as zeros.
             regularizer = torch.reciprocal(torch.mul(R, mf + epsilon), out=regularizer)
-        if torch.sum(torch.lt(normalizer, 1)):
-            normalizer = normalizer.clamp_(min=1)
-        mf = torch.div(torch.bmm(x - mu, Cit) - regularizer, torch.mul(R, normalizer))
+        mf = mf_0 - torch.div(regularizer, torch.mul(R, normalizer))
         mf = torch.nn.functional.relu_(mf)
         # TODO energy
     mf = torch.mul(mf, scaling, out=mf)
