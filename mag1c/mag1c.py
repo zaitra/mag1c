@@ -413,7 +413,7 @@ def read_template_from_mat(mat_file: str) -> np.ndarray:
     return template
 
 
-def get_mask_bad_bands(wave: np.ndarray) -> np.ndarray:
+def get_mask_bad_bands(wave: np.ndarray, use_all_bands: bool) -> np.ndarray:
     """Calculates a mask of the wavelengths to keep based on water vapor absorption features.
     Rejects wavelengths: - Below 400 nm
                          - Above 2485 nm
@@ -421,18 +421,21 @@ def get_mask_bad_bands(wave: np.ndarray) -> np.ndarray:
                          - Between 1800-1945 nm (water absorption region)
 
     :param wave: Vector of wavelengths to evaluate.
+    :param use_all_bands: Boolean indicating that all bands should be used.
     :return:
     """
-    keep_mask = ~(
-        np.logical_or(
-            np.logical_or(wave < 400, wave > 2485),
+    if use_all_bands:
+        return np.ones_like(wave, dtype=bool)
+    else:
+        return ~(
             np.logical_or(
-                np.logical_and(wave > 1350, wave < 1420),
-                np.logical_and(wave > 1800, wave < 1945),
-            ),
+                np.logical_or(wave < 400, wave > 2485),
+                np.logical_or(
+                    np.logical_and(wave > 1350, wave < 1420),
+                    np.logical_and(wave > 1800, wave < 1945),
+                ),
+            )
         )
-    )
-    return keep_mask
 
 
 def get_rbg_band_indexes(wave: np.ndarray) -> np.ndarray:
@@ -1006,6 +1009,11 @@ def main():
         action="store_true",
         help="Save band centers and target spectrum as .npy files (mag1c_centers.npy, mag1c_spectrum.npy)",
     )
+    parser.add_argument(
+        "--use-all-bands",
+        action="store_true",
+        help="Defaultly some water vapour regions like 1350-1420 nm are excluded, with this option, they are included.",
+    )
     # Add the help option back, because we had to remove it from initial parsing so that all options are present.
     parser.add_argument(
         "-h", "--help", action="help", help="show this help message and exit"
@@ -1105,7 +1113,7 @@ def main():
     rgb_wavelengths = wavelengths[rgb_idx]
 
     # Determine mask of what wavelengths will be used in processing -- these bands are independent of thresholding
-    band_keep = get_mask_bad_bands(wavelengths)
+    band_keep = get_mask_bad_bands(wavelengths, args.use_all_bands)
     band_keep[wavelengths < args.use_wavelength_range[0]] = False
     band_keep[wavelengths > args.use_wavelength_range[1]] = False
     wave_keep = wavelengths[band_keep]

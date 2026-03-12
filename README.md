@@ -1,12 +1,15 @@
 # MAG1C-SAS: Matched filter with Albedo correction and reweiGhted L1 Sparsity, Sped up with Additional Sparsity
 
-This repository is a fork of **MAG1C**, modified slightly to create **MAG1C-SAS**. Two additional flags are now available:
+This repository is a fork of **MAG1C**, modified slightly to create **MAG1C-SAS**. Three additional flags are now available:
 
 - `--save-target-spectrum-centers`  
   Saves the centers and target spectrum values as two separate NumPy arrays.
 
 - `--sample [value from 0 to 1]`  
   Instead of running the classic MAG1C, MAG1C-SAS is executed with a specified sample size (given as a fraction between 0 and 1).
+
+- `--use-all-bands`  
+  Defaultly some water vapour regions like 1350-1420 nm are excluded, with this option, they are included.
 
 Additional timing measurements are included (similar to those used for our other filters). This only records the time taken by the core filter function, excluding preprocessing.
 
